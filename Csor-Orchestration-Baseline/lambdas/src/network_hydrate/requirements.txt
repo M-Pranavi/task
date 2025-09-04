@@ -1,0 +1,4 @@
+boto3==1.33.13
+botocore==1.33.13
+requests==2.32.0
+aws-requests-auth==0.4.3
