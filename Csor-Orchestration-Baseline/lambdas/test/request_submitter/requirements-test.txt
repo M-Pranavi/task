@@ -1,0 +1,4 @@
+moto==5.0.28
+pytest==7.4.0
+pytest-mock==3.10.0
+openapi-spec-validator==0.7.1
