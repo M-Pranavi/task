@@ -1,0 +1,9 @@
+# This apply CODEOWNERS for PR review for the whole repository content
+
+* @PayPal-Braintree/bt-cloud-infra
+
+# This apply CODEOWNERS for PR review for specific content in this repository (file, file extension, folder)
+
+# some_file.tf @PayPal-Braintree/<add gh team here> 
+# *.sh @PayPal-Braintree/<add gh team here>
+# bin/ @PayPal-Braintree/<add gh tem here> 
