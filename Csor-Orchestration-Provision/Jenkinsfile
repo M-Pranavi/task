@@ -1,0 +1,901 @@
+package org.braintree.servicenow
+
+def load_accounts;
+def parse_accounts;
+
+parallel_regions = [
+  "eu-central-1",
+  "us-west-2",
+  "us-east-1",
+]
+
+end_to_end = [
+  "tenant-dev": "730335412120",
+  "tenant-qa": "590183724737",
+  "tenant-sand": "767397851611",
+  "tenant-prod": "533267054952",
+]
+
+credentials_map = [
+  "dev": "CSOR_DEV_ORCHESTRATION",
+  "qa": "CSOR_QA_ORCHESTRATION",
+  "tenant-dev": "CSOR_TENANT_DEV_ORCHESTRATION",
+  "tenant-qa": "CSOR_TENANT_QA_ORCHESTRATION",
+  "tenant-sand": "CSOR_TENANT_SAND_ORCHESTRATION",
+  "tenant-prod": "CSOR_TENANT_PROD_ORCHESTRATION",
+]
+
+
+def getLambdas() {
+  return sh(script: "find ${WORKSPACE}/lambdas/src -type d | awk -F/ '{print \$NF}' | grep -v src", returnStdout: true)
+    .trim()
+    .split("\n")
+}
+
+def uploadLambdaCode(env, account) {
+  def lambdas = getLambdas()
+  lambdas = lambdas.collectEntries {[(it): null]}
+  createParallelStages(lambdas) { lambdaName ->
+    docker.image("${CSOR_TOOLING_IMAGE}").inside {
+      withCredentials([aws(credentialsId: credentials_map[env])]) {
+        sh "bin/ci/lambda_package.sh ${lambdaName} ${env} ${account}"
+      }
+    }
+  }
+}
+
+def uploadContainerDefinitions(env, account) {
+  sh "bin/ci/generate_falcon_patched_files.sh ${env}"
+  docker.image("${CSOR_TOOLING_IMAGE}").inside {
+    withCredentials([aws(credentialsId: credentials_map[env])]) {
+      sh "bin/ci/container_definitions_package.sh ${env} ${account}"
+    }
+  }
+}
+
+def uploadLambdaCodeS3deploy(env, account) {
+  def lambdas = getLambdas()
+  lambdas = lambdas.collectEntries {[(it): null]}
+  createParallelStages(lambdas) { lambdaName ->
+    sh "bin/ci/lambda_package_s3deploy.sh ${lambdaName} ${env} ${account}"
+    
+    withAWS(region: "us-east-2") {
+      s3Upload(
+        bucket: "csor-provision-${account}-lambda-artifacts",
+        path: "${lambdaName}/",
+        includePathPattern: "${lambdaName}.zip,version.json",
+        workingDir: "lambdas/src/${lambdaName}"
+      )
+    }
+  }
+}
+
+def uploadContainerDefinitionsS3deploy(env, account) {
+  sh "bin/ci/generate_falcon_patched_files.sh ${env}"
+  sh "bin/ci/container_definitions_package_s3deploy.sh ${env} ${account}"
+  sh "find ${WORKSPACE}/infrastructure -type f -name '*_falcon_patched.json.tfpl' -exec mv {} ${WORKSPACE}/infrastructure/ \\; 2>/dev/null"
+  withAWS(region: "us-east-2") {
+    s3Upload(
+      bucket: "csor-provision-${account}-container-definitions",
+      path: '',
+      includePathPattern: '*_falcon_patched.json.tfpl',
+      workingDir: "${WORKSPACE}/infrastructure",
+      contentType: 'text/template'
+    )
+  }
+}
+
+def runParallelStages(env, region, user, stagesMap) {
+  region = (region instanceof List) ? region.join(', ') : region
+  stagesMap.each { stageName, accounts ->
+    stage("${stageName} [${env} (${region})]") {
+      createParallelStages(accounts) { key, val ->
+        if (region == "us-east-2") {
+          docker.image("${CSOR_TOOLING_IMAGE}").inside {
+            withCredentials([aws(credentialsId: credentials_map[env])]) {
+              sh "bin/ci/provision_single_account.sh ${env} ${val['id']} ${val['name']} ${user} ${val['region']}"
+            }
+          }
+        }
+        else {
+          echo "Provision TODO after multi-region support. Environment: ${env}, Account ID: ${val['id']}, Account Name: ${val['name']}, Region: ${val['region']}]"
+        }
+      }
+    }
+  }
+}
+
+pipeline {
+  agent any
+  options {
+    timestamps()
+  }
+  environment {
+    CM_PLATFORM = "servicenow"
+    CSOR_TOOLING_IMAGE = "dockerhub.braintree.tools/bt/csor-tooling:latest"
+    DD_API_KEY = credentials('DATADOG_API_KEY')
+    DD_APP_KEY = credentials('DATADOG_APP_KEY')
+    FALCON_CID=credentials("FALCON_CID")
+    // Use token from another pipeline to prevent GitHub rate limting when using tflint
+    // This credential ID is a GUID, and not actual credentials
+    GITHUB_TOKEN = credentials("e0998127-5f27-4de4-a5c8-8e4a75b2fc70")
+    SLACK_CHANNEL="#csor-builds"
+    SLACK_APPROVAL_GROUP = "@bt-cloudnx-engineers"
+  }
+  stages {
+    stage('Check CHANGELOG update') {
+      agent any
+      when {
+        anyOf {
+          changeRequest target: 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script {
+          echo "🔧 Ensuring full fetch of Git history..."
+          sh 'git fetch --unshallow || true'
+          sh 'git fetch origin +refs/heads/*:refs/remotes/origin/*'
+          sh 'git diff --name-only origin/main...HEAD'
+          echo "Should fail"
+          def isChangelogUpdated = sh(
+            script: "git diff origin/main...HEAD CHANGELOG.md | grep -q '^+'",
+            returnStatus: true
+          ) == 0
+
+          if (!isChangelogUpdated) {
+            error "Pull request does not include an update to CHANGELOG.md. Please document your changes in the Unreleased section of the changelog."
+          } else {
+            echo "✅ CHANGELOG.md has been updated."
+          }
+        }
+      }
+    }
+    stage('code analysis') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        anyOf {
+          changeRequest target: 'main'
+          branch 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script{
+          sh "pre-commit run --all-files"   
+        }
+      }
+    }
+    stage('CodeQL') {
+      agent any
+      when {
+        anyOf {
+          changeRequest target: 'main'
+          branch 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script {
+          codeQLv2(python: true)
+        }
+      }
+      post {
+        failure {
+          script {
+            FAILED_STAGE = env.STAGE_NAME
+          }
+        }
+      }
+    }
+    stage('Run Lambda tests') {
+      agent any
+      when {
+        anyOf {
+          changeRequest target: 'main'
+          branch 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script {
+          def lambdas = getLambdas()
+          lambdas = lambdas.collectEntries {[(it): null]}
+          createParallelStages(lambdas) { lambdaName ->
+            docker.image("${CSOR_TOOLING_IMAGE}").inside {
+              script {
+                sh "bin/ci/lambda_test.sh ${lambdaName}"
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Determine user') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          user = "jenkins_automation_baseline"
+            if (!currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause').isEmpty()) {
+              user = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0].userId
+            } else if (!currentBuild.getBuildCauses('org.jenkinsci.plugins.github_branch_source.GitHubSenderCause').isEmpty()) {
+              user = currentBuild.getBuildCauses('org.jenkinsci.plugins.github_branch_source.GitHubSenderCause')[0].login
+            }
+            env.USER = user.replaceAll("_paypal", "")
+        }
+      }
+    }
+    stage('Upload Lambda Code [DEV]') {
+      agent any
+      when {
+        branch 'main'
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadLambdaCodeS3deploy("dev", "614751254790")
+        }
+      }
+    }
+    stage('Upload Container Definitions [DEV]') {
+      agent any
+      when {
+        branch 'main'
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitionsS3deploy("dev", "614751254790")
+        }
+      }
+    }
+    stage('Terraform Plan [DEV]') {
+      agent any
+      when {
+        anyOf {
+            changeRequest target: 'main'
+            branch 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-provision-dev-plan"
+          btDeploy(
+            target,
+            revision: env.GIT_COMMIT,
+          )
+        }
+      }
+    }
+    stage('Terraform Apply [DEV]') {
+      agent any
+      when {
+        branch 'main'
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-provision-dev"
+          btDeploy(
+            target,
+            revision: env.GIT_COMMIT,
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [DEV]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        branch 'main'
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_DEV_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/dev.s3.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment internal-dev
+            '''
+          }
+        }
+      }
+    }
+    stage('Upload Lambda Code [QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadLambdaCodeS3deploy("qa", "381492044061")
+        }
+      }
+    }
+    stage('Upload Container Definitions [QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitionsS3deploy("qa", "381492044061")
+        }
+      }
+    }
+    stage('Terraform Apply [QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-provision-qa"
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [QA]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_QA_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/qa.s3.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment internal-qa
+            '''
+          }
+        }
+      }
+    }
+    stage('Upload Lambda Code: [TENANT-DEV]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadLambdaCodeS3deploy("tenant-dev", "339712721196")
+        }
+      }
+    }
+    stage('Upload Container Definitions [TENANT-DEV]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitionsS3deploy("tenant-dev", "339712721196")
+        }
+      }
+    }
+    stage('Terraform Apply [TENANT-DEV]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-provision-tenant-dev"
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [TENANT-DEV]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_TENANT_DEV_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/tenant-dev.s3.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment tenant-dev
+            '''
+          }
+        }
+      }
+    }
+    stage('Bulk Provision [TENANT-DEV]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          load_accounts = load "bin/ci/loadAccounts.groovy"
+          parse_accounts = load "bin/ci/parseAccounts.groovy"
+
+          // Run lowest criticality region ap-southeast-2
+          def env = "tenant-dev"
+          def accounts = load_accounts(env.replace("tenant-", ""))
+          region = "ap-southeast-2"
+          def e2e_account = parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+          def approval_true = parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+          def approval_false = parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+
+          runParallelStages(env, region, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+
+          // Run medium criticality regions eu-central-1, us-east-1 and us-west-2 in parallel
+          e2e_account = [:]
+          approval_false = [:]
+          approval_true = [:]
+          parallel_regions.each { region ->
+            e2e_account += parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+            approval_true += parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+            approval_false += parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+          }
+
+          echo "E2E account ${region}: ${e2e_account}"
+          echo "CHG True ${region}: ${approval_true}"
+          echo "CHG False ${region}: ${approval_true}"
+
+          runParallelStages(env, parallel_regions, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+
+          // Run highest criticality region us-east-2
+          region = "us-east-2"
+          e2e_account = parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+          approval_true = parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+          approval_false = parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+
+          runParallelStages(env, region, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+        }
+      }
+    }
+    stage('Upload Lambda Code: [TENANT-QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadLambdaCodeS3deploy("tenant-qa", "891377279854")
+        }
+      }
+    }
+    stage('Upload Container Definitions [TENANT-QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitionsS3deploy("tenant-qa", "891377279854")
+        }
+      }
+    }
+    stage('Terraform Apply [TENANT-QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-provision-tenant-qa"
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [TENANT-QA]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_TENANT_QA_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/tenant-qa.s3.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment tenant-qa
+            '''
+          }
+        }
+      }
+    }
+    stage('Bulk Provision [TENANT-QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          load_accounts = load "bin/ci/loadAccounts.groovy"
+          parse_accounts = load "bin/ci/parseAccounts.groovy"
+
+          // Run lowest criticality region ap-southeast-2
+          def env = "tenant-qa"
+          def accounts = load_accounts(env.replace("tenant-", ""))
+          region = "ap-southeast-2"
+          def e2e_account = parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+          def approval_true = parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+          def approval_false = parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+
+          runParallelStages(env, region, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+
+          // Run medium criticality regions eu-central-1, us-east-1 and us-west-2 in parallel
+          e2e_account = [:]
+          approval_false = [:]
+          approval_true = [:]
+          parallel_regions.each { region ->
+            e2e_account += parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+            approval_true += parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+            approval_false += parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+          }
+
+          runParallelStages(env, parallel_regions, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+
+          // Run highest criticality region us-east-2
+          region = "us-east-2"
+          e2e_account = parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+          approval_true = parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+          approval_false = parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+
+          runParallelStages(env, region, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+        }
+      }
+    }
+    stage('Upload Lambda Code: [TENANT-SAND]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadLambdaCode("tenant-sand", "339713027185")
+        }
+      }
+    }
+    stage('Upload Container Definitions [TENANT-SAND]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitions("tenant-sand", "339713027185")
+        }
+      }
+    }
+    stage('Terraform Apply [TENANT-SAND]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-provision-tenant-sand"
+          def credentialsIdMap = requestAuthorization(
+            targets: [target],
+            revision: env.TAG_NAME,
+            deployEnv: "csor-orchestration-tenant-sand",
+            channel: env.SLACK_CHANNEL,
+            handle: env.SLACK_APPROVAL_GROUP,
+          )
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+            credentialsId: credentialsIdMap[target],
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [TENANT-SAND]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_TENANT_SAND_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/tenant-sand.s3.assume-role.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment tenant-sand
+            '''
+        }
+        }
+      }
+    }
+    stage('Bulk Provision [TENANT-SAND]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          load_accounts = load "bin/ci/loadAccounts.groovy"
+          parse_accounts = load "bin/ci/parseAccounts.groovy"
+
+          // Run lowest criticality region ap-southeast-2
+          def env = "tenant-sand"
+          def accounts = load_accounts(env.replace("tenant-", ""))
+          region = "ap-southeast-2"
+          def e2e_account = parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+          def approval_true = parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+          def approval_false = parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+
+          runParallelStages(env, region, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+
+          // Run medium criticality regions eu-central-1, us-east-1 and us-west-2 in parallel
+          e2e_account = [:]
+          approval_false = [:]
+          approval_true = [:]
+          parallel_regions.each { region ->
+            e2e_account += parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+            approval_true += parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+            approval_false += parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+          }
+
+          runParallelStages(env, parallel_regions, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+
+          // Run highest criticality region us-east-2
+          region = "us-east-2"
+          e2e_account = parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+          approval_true = parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+          approval_false = parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+
+          runParallelStages(env, region, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+        }
+      }
+    }
+    stage('Upload Lambda Code: [TENANT-PROD]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadLambdaCode("tenant-prod", "339712719475")
+        }
+      }
+    }
+    stage('Upload Container Definitions [TENANT-PROD]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitions("tenant-prod", "339712719475")
+        }
+      }
+    }
+    stage("SNOW Change Request and Terraform Apply [TENANT-PROD]") {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target="csor-orchestration-provision-tenant-prod"
+          slackSend(message: "Deploying CSoR Orchestration Provision to `tenant-prod` @ `${env.TAG_NAME}` (initiated by `${findUserFromBuildCause()}`)", channel: "#csor-builds")
+          // terraform plan
+          def credentialsIdMap = requestAuthorization(
+            targets: [target],
+            revision: env.TAG_NAME,
+            deployEnv: "csor-orchestration-tenant-prod",
+            channel: env.SLACK_CHANNEL,
+            handle: env.SLACK_APPROVAL_GROUP,
+          )
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+            credentialsId: credentialsIdMap[target],
+            dryRun: true,
+          )
+          def rollbackRevision = sh(script: "git ls-remote --tags --refs -q | cut -f 2 | sed -nr 's/refs\\/tags\\/([0-9]+\\.[0-9]+\\.[0-9]+)/\\1/p' | sort | tail -2 | head -1", returnStdout: true).trim()
+          requestChangeApprovalThroughServiceNow(
+            templateName: "CSoR Platform Deployment",
+            channel: "#csor-builds",
+            rollbackRevision: rollbackRevision,
+            applicationName: "csor-orchestration-provision",
+          )
+          // terraform apply
+          credentialsIdMap = requestAuthorization(
+            targets: [target],
+            revision: env.TAG_NAME,
+            deployEnv: "csor-orchestration-tenant-prod",
+            channel: env.SLACK_CHANNEL,
+            handle: env.SLACK_APPROVAL_GROUP,
+          )
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+            credentialsId: credentialsIdMap[target],
+            withServiceNow: true,
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [TENANT-PROD]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_TENANT_PROD_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/tenant-prod.s3.assume-role.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment tenant-prod
+            '''
+          }
+        }
+      }
+    }
+    stage('Bulk Provision [TENANT-PROD]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          load_accounts = load "bin/ci/loadAccounts.groovy"
+          parse_accounts = load "bin/ci/parseAccounts.groovy"
+
+          // Run lowest criticality region ap-southeast-2
+          def env = "tenant-prod"
+          def accounts = load_accounts(env.replace("tenant-", ""))
+          region = "ap-southeast-2"
+          def e2e_account = parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+          def approval_true = parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+          def approval_false = parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+
+          runParallelStages(env, region, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+
+          // Run medium criticality regions eu-central-1, us-east-1 and us-west-2 in parallel
+          e2e_account = [:]
+          approval_false = [:]
+          approval_true = [:]
+          parallel_regions.each { region ->
+            e2e_account += parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+            approval_true += parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+            approval_false += parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+          }
+
+          runParallelStages(env, parallel_regions, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+
+          // Run highest criticality region us-east-2
+          region = "us-east-2"
+          e2e_account = parse_accounts(account: end_to_end[env], region: region, accounts: accounts, env: env)
+          approval_true = parse_accounts(region: region, approval: true, accounts: accounts, env: env)
+          approval_false = parse_accounts(region: region, approval: false, accounts: accounts, env: env)
+
+          runParallelStages(env, region, "${USER}", [
+            "E2E": e2e_account,
+            "CHG True": approval_true,
+            "CHG False": approval_false
+          ])
+        }
+      }
+    }
+  }
+  post{
+    success{
+      script {
+        if (env.BRANCH_NAME == 'main' || env.TAG_NAME ==~ /^\d+\.\d+\.\d+$/) {
+          currentBuild.result = "SUCCESS"
+          slackSend(color: 'good', message: "Build ${env.BUILD_URL} Successful for CSoR Orchestration Provision", channel: "#csor-builds")
+        }
+      }
+    }
+    failure{
+        script {
+          if (env.BRANCH_NAME == 'main' || env.TAG_NAME ==~ /^\d+\.\d+\.\d+$/) {
+            currentBuild.result = "FAILURE"
+            slackSend(color: 'danger', message: "Build #${env.BUILD_URL} Failed for CSoR Orchestration Provision", channel: "#csor-builds")
+          }
+        }
+    }
+    always {
+      script {
+        if (env.TAG_NAME ==~ /^\d+\.\d+\.\d+$/) {
+          notifyServiceNow()
+        }
+      }
+    }
+  }
+}
