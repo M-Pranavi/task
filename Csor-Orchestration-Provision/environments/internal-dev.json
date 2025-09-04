@@ -1,0 +1,12 @@
+{
+  "orchestration_url": "https://v4g1gd0jni-vpce-0a8103716a6bb595d.execute-api.us-east-2.amazonaws.com/csor_orchestration/provision",
+  "orchestration_aws_region": "us-east-2",
+  "orchestration_aws_assume_role": "arn:aws:iam::614751254790:role/csor-nonprod-dev-jenkins-service-account-role",
+  "sor_url": "https://jc36bzfu99-vpce-0a8103716a6bb595d.execute-api.us-east-2.amazonaws.com/csor_sor/graphql",
+  "sor_aws_region": "us-east-2",
+  "e2e_aws_account_num": "992382467107",
+  "e2e_aws_account_env": "DEV",
+  "e2e_aws_account_name": "dev-bt-app6",
+  "parallelism": 2,
+  "max_wait_time_in_minutes": 60
+}
