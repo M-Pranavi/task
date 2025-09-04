@@ -1,0 +1,824 @@
+package org.braintree.servicenow
+
+credentials_map = [
+  "dev": "CSOR_DEV_ORCHESTRATION",
+  "qa": "CSOR_QA_ORCHESTRATION",
+  "tenant-dev": "CSOR_TENANT_DEV_ORCHESTRATION",
+  "tenant-qa": "CSOR_TENANT_QA_ORCHESTRATION",
+  "tenant-sand": "CSOR_TENANT_SAND_ORCHESTRATION",
+  "tenant-prod": "CSOR_TENANT_PROD_ORCHESTRATION",
+]
+
+def regions = [
+  "ap-southeast-2",
+  "eu-central-1",
+  "us-west-2",
+  "us-east-1",
+  "us-east-2",
+]
+
+def checkLambdaChanges(env, account) {
+  echo "Checking for Lambda code changes for environment: ${env}"
+  
+  def result = [changedLambdas: []]
+  
+  docker.image("${CSOR_TOOLING_IMAGE}").inside {
+    withCredentials([aws(credentialsId: credentials_map[env])]) {
+      sh "pip3 install -r bin/scripts/requirements.txt"
+
+      def checkOutput = sh(
+        script: "python3 bin/scripts/lambda_changes.py --env ${env} --account ${account}",
+        returnStdout: true
+      ).trim()
+      
+      def changedLambdasMatch = checkOutput =~ /CHANGED_LAMBDAS_${env.toUpperCase()}=(.+)/
+      if (changedLambdasMatch) {
+        result.changedLambdas = changedLambdasMatch[0][1].split(' ')
+      }
+    }
+  }
+  
+  return result
+}
+
+def getLambdas() {
+  return sh(script: "find ${WORKSPACE}/lambdas/src -type d | awk -F/ '{print \$NF}' | grep -v src", returnStdout: true)
+    .trim()
+    .split("\n")
+}
+
+def uploadLambdaCode(env, account, lambdasToUpload) {
+  def lambdas = lambdasToUpload ?: getLambdas()
+  lambdas = lambdas.collectEntries {[(it): null]}
+  createParallelStages(lambdas) { lambdaName ->
+    docker.image("${CSOR_TOOLING_IMAGE}").inside {
+      withCredentials([aws(credentialsId: credentials_map[env])]) {
+        sh "bin/ci/lambda_package.sh ${lambdaName} ${env} ${account}"
+      }
+    }
+  }  
+  // Only update hashes after successful upload
+  docker.image("${CSOR_TOOLING_IMAGE}").inside {
+    withCredentials([aws(credentialsId: credentials_map[env])]) {
+      sh "pip3 install -r bin/scripts/requirements.txt"
+      sh "python3 bin/scripts/lambda_changes.py --env ${env} --account ${account} --update-hashes"
+    }
+  }
+}
+
+def uploadContainerDefinitions(env, account) {
+  sh "bin/ci/generate_falcon_patched_files.sh ${env}"
+  docker.image("${CSOR_TOOLING_IMAGE}").inside {
+    withCredentials([aws(credentialsId: credentials_map[env])]) {
+      sh "bin/ci/container_definitions_package.sh ${env} ${account}"
+    }
+  }
+}
+
+def uploadLambdaCodeS3deploy(env, account, lambdasToUpload) {
+  def lambdas = lambdasToUpload ?: getLambdas()
+  lambdas = lambdas.collectEntries {[(it): null]}
+  createParallelStages(lambdas) { lambdaName ->
+    sh "bin/ci/lambda_package_s3deploy.sh ${lambdaName} ${env} ${account}"
+    
+    withAWS(region: "us-east-2") {
+      s3Upload(
+        bucket: "csor-baseline-${account}-lambda-artifacts",
+        path: "${lambdaName}/",
+        includePathPattern: "${lambdaName}.zip,version.json",
+        workingDir: "lambdas/src/${lambdaName}"
+      )
+    }
+  }
+  
+  withCredentials([aws(credentialsId: credentials_map[env])]) {
+    sh "pip3 install -r bin/scripts/requirements.txt"
+    sh "python3 bin/scripts/lambda_changes.py --env ${env} --account ${account} --update-hashes"
+  }
+}
+
+def uploadContainerDefinitionsS3deploy(env, account) {
+  sh "bin/ci/generate_falcon_patched_files.sh ${env}"
+  sh "bin/ci/container_definitions_package_s3deploy.sh ${env} ${account}"
+  sh "find ${WORKSPACE}/infrastructure -type f -name '*_falcon_patched.json.tfpl' -exec mv {} ${WORKSPACE}/infrastructure/ \\; 2>/dev/null"
+  withAWS(region: "us-east-2") {
+    s3Upload(
+      bucket: "csor-baseline-${account}-container-definitions",
+      path: '',
+      includePathPattern: '*_falcon_patched.json.tfpl',
+      workingDir: "${WORKSPACE}/infrastructure",
+      contentType: 'text/template'
+    )
+  }
+}
+
+pipeline {
+  agent any
+  options {
+    timestamps()
+  }
+  environment {
+    CM_PLATFORM = "servicenow"
+    CSOR_TOOLING_IMAGE = "dockerhub.braintree.tools/bt/csor-tooling:latest"
+    DD_API_KEY = credentials('DATADOG_API_KEY')
+    DD_APP_KEY = credentials('DATADOG_APP_KEY')
+    FALCON_CID = credentials("FALCON_CID")
+    SLACK_CHANNEL="#csor-builds"
+    SLACK_APPROVAL_GROUP = "@bt-cloudnx-engineers"
+  }
+  stages {
+    stage('Check CHANGELOG update') {
+      agent any
+      when {
+        anyOf {
+          changeRequest target: 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script {
+          echo "🔧 Ensuring full fetch of Git history..."
+          sh 'git fetch --unshallow || true'
+          sh 'git fetch origin +refs/heads/*:refs/remotes/origin/*'
+
+          sh 'git diff --name-only origin/main...HEAD'
+
+          def isChangelogUpdated = sh(
+            script: "git diff origin/main...HEAD CHANGELOG.md | grep -q '^+'",
+            returnStatus: true
+          ) == 0
+
+          if (!isChangelogUpdated) {
+            error "Pull request does not include an update to CHANGELOG.md. Please document your changes in the Unreleased section of the changelog."
+          } else {
+            echo "✅ CHANGELOG.md has been updated."
+          }
+        }
+      }
+    }
+    stage('code analysis') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        anyOf {
+          changeRequest target: 'main'
+          branch 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script{
+          sh "pre-commit run --all-files"
+        }
+      }
+    }
+    stage("CodeQL") {
+      agent {
+        node {
+          label ""
+          customWorkspace "workspace/csor-orchestration-baseline"
+        }
+      }
+      when {
+        anyOf {
+          changeRequest target: 'main'
+          branch 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script {
+          codeQLv2(python: true)
+        }
+      }
+      post {
+        failure {
+          script {
+            FAILED_STAGE = env.STAGE_NAME
+          }
+        }
+      }
+    }
+    stage('Run Lambda tests') {
+      agent any
+      when {
+        anyOf {
+          changeRequest target: 'main'
+          branch 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script {
+          parallel(
+            "Lambda Tests": {
+              def lambdas = getLambdas()
+              lambdas = lambdas.collectEntries {[(it): null]}
+              createParallelStages(lambdas) { lambdaName ->
+                docker.image("${CSOR_TOOLING_IMAGE}").inside {
+                  script {
+                    sh "bin/ci/lambda_test.sh ${lambdaName}"
+                  }
+                }
+              }
+            },
+            "Script Tests": {
+              docker.image("${CSOR_TOOLING_IMAGE}").inside {
+                script {
+                  sh "bin/ci/script_test.sh"
+                }
+              }
+            }
+          )
+        }
+      }
+    }
+    stage('Upload Lambda Code [DEV]') {
+      agent any
+      when {
+        branch 'main'
+        beforeAgent true
+      }
+      steps {
+        script {
+          def lambdaChanges = checkLambdaChanges("dev", "614751254790")
+          if (lambdaChanges.changedLambdas.size() > 0) {
+            echo "Lambda changes detected for dev, uploading lambdas: ${lambdaChanges.changedLambdas.join(', ')}"
+            uploadLambdaCodeS3deploy("dev", "614751254790", lambdaChanges.changedLambdas)
+          } else {
+            echo "No Lambda changes detected for dev, skipping upload"
+          }
+        }
+      }
+    }
+    stage('Upload Container Definitions [DEV]') {
+      agent any
+      when {
+        branch 'main'
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitionsS3deploy("dev", "614751254790")
+        }
+      }
+    }
+    stage('Terraform Plan [DEV]') {
+      agent any
+      when {
+        anyOf {
+            changeRequest target: 'main'
+            branch 'main'
+        }
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-baseline-dev-plan"
+          btDeploy(
+            target,
+            revision: env.GIT_COMMIT,
+          )
+        }
+      }
+    }
+    stage('Terraform Apply [DEV]') {
+      agent any
+      when {
+        branch 'main'
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-baseline-dev"
+          btDeploy(
+            target,
+            revision: env.GIT_COMMIT,
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [DEV]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        branch 'main'
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_DEV_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/dev.s3.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment internal-dev
+            '''
+          }
+        }
+      }
+    }
+    stage('End To End [DEV]') {
+      agent any
+      when {
+        branch 'main'
+        beforeAgent true
+      }
+      steps {
+        script {
+          createParallelStages(regions) { region ->
+            docker.image("${CSOR_TOOLING_IMAGE}").inside {
+              withCredentials([aws(credentialsId: 'CSOR_DEV_ORCHESTRATION')]) {
+                sh "bin/ci/end_to_end_test.sh --environment internal-dev --region ${region}"
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Upload Lambda Code [QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def lambdaChanges = checkLambdaChanges("qa", "381492044061")
+          if (lambdaChanges.changedLambdas.size() > 0) {
+            echo "Lambda changes detected for qa, uploading lambdas: ${lambdaChanges.changedLambdas.join(', ')}"
+            uploadLambdaCodeS3deploy("qa", "381492044061", lambdaChanges.changedLambdas)
+          } else {
+            echo "No Lambda changes detected for qa, skipping upload"
+          }
+        }
+      }
+    }
+    stage('Upload Container Definitions [QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitionsS3deploy("qa", "381492044061")
+        }
+      }
+    }
+    stage('Terraform Apply [QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-baseline-qa"
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [QA]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_QA_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/qa.s3.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment internal-qa
+            '''
+          }
+        }
+      }
+    }
+    stage('End To End [QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          createParallelStages(regions) { region ->
+            docker.image("${CSOR_TOOLING_IMAGE}").inside {
+              withCredentials([aws(credentialsId: 'CSOR_QA_ORCHESTRATION')]) {
+                sh "bin/ci/end_to_end_test.sh --environment internal-qa --region ${region}"
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Upload Lambda Code [TENANT-DEV]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def lambdaChanges = checkLambdaChanges("tenant-dev", "339712721196")
+          if (lambdaChanges.changedLambdas.size() > 0) {
+            echo "Lambda changes detected for tenant-dev, uploading lambdas: ${lambdaChanges.changedLambdas.join(', ')}"
+            uploadLambdaCodeS3deploy("tenant-dev", "339712721196", lambdaChanges.changedLambdas)
+          } else {
+            echo "No Lambda changes detected for tenant-dev, skipping upload"
+          }
+        }
+      }
+    }
+    stage('Upload Container Definitions [TENANT-DEV]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitionsS3deploy("tenant-dev", "339712721196")
+        }
+      }
+    }
+    stage('Terraform Apply [TENANT-DEV]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-baseline-tenant-dev"
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [TENANT-DEV]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_TENANT_DEV_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/tenant-dev.s3.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment tenant-dev
+            '''
+          }
+        }
+      }
+    }
+    stage('End To End [TENANT-DEV]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          createParallelStages(regions) { region ->
+            docker.image("${CSOR_TOOLING_IMAGE}").inside {
+              withCredentials([aws(credentialsId: 'CSOR_TENANT_DEV_ORCHESTRATION')]) {
+                sh "bin/ci/end_to_end_test.sh --environment tenant-dev --region ${region}"
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Upload Lambda Code [TENANT-QA]') {
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def lambdaChanges = checkLambdaChanges("tenant-qa", "891377279854")
+          if (lambdaChanges.changedLambdas.size() > 0) {
+            echo "Lambda changes detected for tenant-qa, uploading lambdas: ${lambdaChanges.changedLambdas.join(', ')}"
+            uploadLambdaCodeS3deploy("tenant-qa", "891377279854", lambdaChanges.changedLambdas)
+          } else {
+            echo "No Lambda changes detected for tenant-qa, skipping upload"
+          }
+        }
+      }
+    }
+    stage('Upload Container Definitions [TENANT-QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitionsS3deploy("tenant-qa", "891377279854")
+        }
+      }
+    }
+    stage('Terraform Apply [TENANT-QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-baseline-tenant-qa"
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [TENANT-QA]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_TENANT_QA_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/tenant-qa.s3.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment tenant-qa
+            '''
+          }
+        }
+      }
+    }
+    stage('End To End [TENANT-QA]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          createParallelStages(regions) { region ->
+            docker.image("${CSOR_TOOLING_IMAGE}").inside {
+              withCredentials([aws(credentialsId: 'CSOR_TENANT_QA_ORCHESTRATION')]) {
+                sh "bin/ci/end_to_end_test.sh --environment tenant-qa --region ${region}"
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Upload Lambda Code [TENANT-SAND]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def lambdaChanges = checkLambdaChanges("tenant-sand", "339713027185")
+          if (lambdaChanges.changedLambdas.size() > 0) {
+            echo "Lambda changes detected for tenant-sand, uploading lambdas: ${lambdaChanges.changedLambdas.join(', ')}"
+            uploadLambdaCode("tenant-sand", "339713027185", lambdaChanges.changedLambdas)
+          } else {
+            echo "No Lambda changes detected for tenant-sand, skipping upload"
+          }
+        }
+      }
+    }
+    stage('Upload Container Definitions [TENANT-SAND]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitions("tenant-sand", "339713027185")
+        }
+      }
+    }
+    stage('Terraform Apply [TENANT-SAND]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target = "csor-orchestration-baseline-tenant-sand"
+          def credentialsIdMap = requestAuthorization(
+            targets: [target],
+            revision: env.TAG_NAME,
+            deployEnv: "csor-orchestration-tenant-sand",
+            channel: env.SLACK_CHANNEL,
+            handle: env.SLACK_APPROVAL_GROUP,
+          )
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+            credentialsId: credentialsIdMap[target],
+          )
+        }
+      }
+    }
+    stage('Hydrate SOR [TENANT-SAND]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_TENANT_SAND_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/tenant-sand.s3.assume-role.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment tenant-sand
+            '''
+        }
+        }
+      }
+    }
+    stage('End To End [TENANT-SAND]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          createParallelStages(regions) { region ->
+            docker.image("${CSOR_TOOLING_IMAGE}").inside {
+              withCredentials([aws(credentialsId: 'CSOR_TENANT_SAND_ORCHESTRATION')]) {
+                sh "bin/ci/end_to_end_test.sh --environment tenant-sand --region ${region}"
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Upload Lambda Code [TENANT-PROD]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def lambdaChanges = checkLambdaChanges("tenant-prod", "339712719475")
+          if (lambdaChanges.changedLambdas.size() > 0) {
+            echo "Lambda changes detected for tenant-prod, uploading lambdas: ${lambdaChanges.changedLambdas.join(', ')}"
+            uploadLambdaCode("tenant-prod", "339712719475", lambdaChanges.changedLambdas)
+          } else {
+            echo "No Lambda changes detected for tenant-prod, skipping upload"
+          }
+        }
+      }
+    }
+    stage('Upload Container Definitions [TENANT-PROD]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          uploadContainerDefinitions("tenant-prod", "339712719475")
+        }
+      }
+    }
+    stage('SNOW Change Request and Terraform Apply [TENANT-PROD]'){
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          def target="csor-orchestration-baseline-tenant-prod"
+          slackSend(message: "Deploying CSoR Orchestration Baseline to `tenant-prod` @ `${env.TAG_NAME}` (initiated by `${findUserFromBuildCause()}`)", channel: "#csor-builds")
+          // terraform plan
+          def credentialsIdMap = requestAuthorization(
+            targets: [target],
+            revision: env.TAG_NAME,
+            deployEnv: "csor-orchestration-tenant-prod",
+            channel: env.SLACK_CHANNEL,
+            handle: env.SLACK_APPROVAL_GROUP,
+          )
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+            credentialsId: credentialsIdMap[target],
+            dryRun: true,
+          )
+          def rollbackRevision = sh(script: "git ls-remote --tags --refs -q | cut -f 2 | sed -nr 's/refs\\/tags\\/([0-9]+\\.[0-9]+\\.[0-9]+)/\\1/p' | sort | tail -2 | head -1", returnStdout: true).trim()
+          requestChangeApprovalThroughServiceNow(
+            applicationName: "csor-orchestration-baseline",
+            templateName: "CSoR Platform Deployment",
+            channel: "#csor-builds", 
+            rollbackRevision: rollbackRevision,
+          )
+          // terraform apply
+          credentialsIdMap = requestAuthorization(
+            targets: [target],
+            revision: env.TAG_NAME,
+            deployEnv: "csor-orchestration-tenant-prod",
+            channel: env.SLACK_CHANNEL,
+            handle: env.SLACK_APPROVAL_GROUP,
+          )
+          btDeploy(
+            target,
+            revision: env.TAG_NAME,
+            credentialsId: credentialsIdMap[target],
+            withServiceNow: true,
+          )
+          notifyServiceNow()
+        }
+      }
+    }
+    stage('Hydrate SOR [TENANT-PROD]') {
+      agent { docker { image "${CSOR_TOOLING_IMAGE}" } }
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        dir('infrastructure'){
+          withCredentials([aws(
+          credentialsId: 'CSOR_TENANT_PROD_ORCHESTRATION'
+        )]){
+            sh 'terraform init -backend-config=tfvars/tenant-prod.s3.assume-role.tfbackend'
+            sh '''
+                terraform output -json > terraform_outputs.json
+                sh ../bin/ci/hydrate_sor.sh --environment tenant-prod
+            '''
+        }
+        }
+      }
+    }
+    stage('End To End [TENANT-PROD]') {
+      agent any
+      when {
+        tag pattern: "^\\d+\\.\\d+\\.\\d+\$", comparator: "REGEXP"
+        beforeAgent true
+      }
+      steps {
+        script {
+          createParallelStages(regions) { region ->
+            docker.image("${CSOR_TOOLING_IMAGE}").inside {
+              withCredentials([aws(credentialsId: 'CSOR_TENANT_PROD_ORCHESTRATION')]) {
+                sh "bin/ci/end_to_end_test.sh --environment tenant-prod --region ${region}"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  post{
+    success{
+        script {
+          if (env.BRANCH_NAME == 'main' || env.TAG_NAME ==~ /^\d+\.\d+\.\d+$/) {
+            currentBuild.result = "SUCCESS"
+            slackSend(color: 'good', message: "Build ${env.BUILD_URL} Successful for CSoR Orchestration Baseline", channel: "#csor-builds")
+          }
+        }
+    }
+    failure{
+        script {
+          if (env.BRANCH_NAME == 'main' || env.TAG_NAME ==~ /^\d+\.\d+\.\d+$/) {
+            currentBuild.result = "FAILURE"
+            slackSend(color: 'danger', message: "Build #${env.BUILD_URL} Failed for CSoR Orchestration Baseline", channel: "#csor-builds")
+          }
+        }
+    }
+    always{
+      script {
+        if (env.TAG_NAME ==~ /^\d+\.\d+\.\d+$/) {
+          notifyServiceNow()
+        }
+      }
+    }
+  }
+}
