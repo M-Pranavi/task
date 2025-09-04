@@ -1,0 +1,16 @@
+{
+  accounts(deployerName: "eks_deployer") {
+    id
+    name
+    regions
+    provisionChangeApprovalRequired
+    appInfra {
+      region
+      lastSuccess {
+        deployers {
+          outputs
+        }
+      }
+    }
+  }
+}
